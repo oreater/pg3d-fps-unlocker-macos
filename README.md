@@ -100,3 +100,9 @@ The game's `fpsParamKey` is an integer and its neighboring Boolean is an initial
 - All pacing changes apply only to the launched process. To revert, quit it and start normally through Steam.
 - It deliberately starts the game executable directly rather than through `open`, because macOS does not reliably carry `DYLD_INSERT_LIBRARIES` through Launch Services.
 - The game is a signed third-party client. Use of modifications may be governed by its terms or anti-cheat policy; use this only where permitted.
+
+
+
+
+## Author's note
+vibecoded as hell.
