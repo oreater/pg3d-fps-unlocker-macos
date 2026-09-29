@@ -1,0 +1,395 @@
+#!/bin/zsh
+
+set -euo pipefail
+
+script_dir=${0:A:h}
+dylib="$script_dir/build/PG3DFPSUnlock.dylib"
+default_game="$HOME/Library/Application Support/Steam/steamapps/common/Pixel Gun 3D PC Edition/Pixel Gun 3D.app"
+game="$default_game"
+fps="-1"
+dry_run=0
+show_status=0
+observe=0
+show_hud=0
+profile=balanced
+set_profile=0
+postfx=profile
+set_postfx=0
+set_occlusion=0
+occlusion=game
+set_extras=0
+extras=on
+set_mouse=0
+mouse=game
+stage_profile=1
+gfx_jobs=0
+job_workers=auto
+steam_dir="$HOME/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS"
+log_directory="$HOME/Library/Logs/OptimizerUnlocker"
+latest_record="$log_directory/latest"
+# Single source of truth for reviewed builds. The native library validates each
+# build's exact bindings again at runtime before changing anything.
+supported_builds=(26.11.0/151027 26.11.3/155325)
+
+# Exit status: 0 success, 1 general failure, 2 invalid arguments,
+# 3 unsupported game build, 4 game binary cannot load the optimizer,
+# 5 game launched but readiness was not confirmed yet (still loading).
+readonly EXIT_UNSUPPORTED_BUILD=3 EXIT_INCOMPATIBLE_GAME=4 EXIT_NOT_READY=5
+
+usage() {
+  cat <<'EOF'
+Usage: ./testificateunlocker [options]
+
+  --fps N          30–1000, or 0 / uncapped for no cap (default: uncapped)
+  --observe        Measure the game's original pacing without changing it
+  --profile NAME   original / balanced (default) / performance
+  --set-occlusion MODE Diagnostic: game / off in current session
+  --postfx MODE    profile (default) / game / off, for the main camera
+  --set-postfx MODE Change post-processing alone in the current session
+  --set-profile NAME Change profile in the current optimizer session
+  --hud            Show Apple's Metal performance overlay for this run
+  --gfx-jobs       Experimental: ask Unity for multithreaded (native) graphics jobs
+  --job-workers N  auto (default) or 1–32: Unity job worker threads (-job-worker-count)
+  --set-camera-extras on|off  Performance: drop leftover depth/HDR camera work (default on)
+  --mouse MODE     game (default) / fast: fast mouse look skips AppKit window
+                   routing for mouse motion while the game has the cursor locked
+  --set-mouse MODE Change the mouse mode in the current session
+  --no-stage-profile Do not time player-loop stages (mouse-motion frame profile)
+  --game PATH      Path to Pixel Gun 3D.app
+  --steam-dir PATH Steam directory containing steamloader/gameoverlayrenderer.dylib
+  --dry-run        Validate prerequisites without launching
+  --status         Show the latest run's process status and measurements
+  --supported-builds Print reviewed game builds (VERSION/BUILD), one per line
+  -h, --help       Show this help
+EOF
+}
+
+while (( $# )); do
+  case "$1" in
+    --fps)
+      (( $# >= 2 )) || { print -u2 -- "--fps needs a value"; exit 2; }
+      case "$2" in
+        0|uncapped) fps="-1" ;;
+        <->)
+          if (( $2 >= 30 && $2 <= 1000 )); then
+            fps="$2"
+          else
+            print -u2 -- "FPS must be 30–1000, 0, or uncapped."
+            exit 2
+          fi
+          ;;
+        *) print -u2 -- "FPS must be 30–1000, 0, or uncapped."; exit 2 ;;
+      esac
+      shift 2
+      ;;
+    --set-occlusion)
+      (( $# >= 2 )) || { print -u2 -- '--set-occlusion needs a value'; exit 2; }
+      [[ "$2" == game || "$2" == off ]] || { print -u2 'Occlusion mode must be game or off.'; exit 2; }
+      set_occlusion=1; occlusion="$2"; shift 2 ;;
+    --postfx|--set-postfx)
+      (( $# >= 2 )) || { print -u2 -- "$1 needs a value"; exit 2; }
+      [[ "$2" == profile || "$2" == game || "$2" == off ]] || { print -u2 'Post FX mode must be profile, game, or off.'; exit 2; }
+      [[ "$1" != --set-postfx ]] || set_postfx=1
+      postfx="$2"; shift 2 ;;
+    --profile|--set-profile)
+      (( $# >= 2 )) || { print -u2 -- "$1 needs a value"; exit 2; }
+      [[ "$2" == original || "$2" == balanced || "$2" == performance ]] || { print -u2 -- "Profile must be original, balanced, or performance."; exit 2; }
+      [[ "$1" != --set-profile ]] || set_profile=1
+      profile="$2"; shift 2 ;;
+    --observe) observe=1; shift ;;
+    --gfx-jobs) gfx_jobs=1; shift ;;
+    --job-workers)
+      (( $# >= 2 )) || { print -u2 -- '--job-workers needs a value'; exit 2; }
+      if [[ "$2" == auto ]]; then
+        job_workers=auto
+      elif [[ "$2" == <-> ]] && (( $2 >= 1 && $2 <= 32 )); then
+        job_workers=$2
+      else
+        print -u2 -- 'Job workers must be auto or 1–32.'; exit 2
+      fi
+      shift 2 ;;
+    --set-camera-extras)
+      (( $# >= 2 )) || { print -u2 -- '--set-camera-extras needs a value'; exit 2; }
+      [[ "$2" == on || "$2" == off ]] || { print -u2 'Camera extras mode must be on or off.'; exit 2; }
+      set_extras=1; extras="$2"; shift 2 ;;
+    --mouse|--set-mouse)
+      (( $# >= 2 )) || { print -u2 -- "$1 needs a value"; exit 2; }
+      [[ "$2" == game || "$2" == fast ]] || { print -u2 'Mouse mode must be game or fast.'; exit 2; }
+      [[ "$1" != --set-mouse ]] || set_mouse=1
+      mouse="$2"; shift 2 ;;
+    --no-stage-profile) stage_profile=0; shift ;;
+    --hud) show_hud=1; shift ;;
+    --game)
+      (( $# >= 2 )) || { print -u2 -- "--game needs a path"; exit 2; }
+      game="$2"
+      shift 2
+      ;;
+    --steam-dir)
+      (( $# >= 2 )) || { print -u2 -- "--steam-dir needs a path"; exit 2; }
+      steam_dir="$2"
+      shift 2
+      ;;
+    --dry-run) dry_run=1; shift ;;
+    --status) show_status=1; shift ;;
+    --supported-builds) print -l -- $supported_builds; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) print -u2 -- "Unknown option: $1"; usage >&2; exit 2 ;;
+  esac
+done
+
+process_is_alive() {
+  local process_details process_uid process_state process_command
+  [[ "$1" == <-> ]] || return 1
+  process_details=$(ps -p "$1" -o uid=,stat=,comm= 2>/dev/null) || return 1
+  read -r process_uid process_state process_command <<< "$process_details"
+  [[ "$process_uid" == "$UID" && -n "$process_state" && "$process_state" != *Z* && "$process_command" == *"/Contents/MacOS/Pixel Gun 3D" ]]
+}
+
+if (( set_profile + set_postfx + set_occlusion + set_extras + set_mouse > 1 )); then
+  print -u2 'Use one live control command at a time.'; exit 2
+fi
+if (( set_profile || set_postfx || set_occlusion || set_extras || set_mouse )); then
+  [[ -f "$latest_record" ]] || { print -u2 'No optimizer session.'; exit 1; }
+  log_file=$(< "$latest_record")
+  [[ "$log_file" == "$log_directory/"run-*.log && -f "${log_file}.pid" && -f "${log_file}.profile" ]] || { print -u2 'Invalid session.'; exit 1; }
+  process_is_alive "$(< "${log_file}.pid")" || { print -u2 'Optimizer game is not running.'; exit 1; }
+  /usr/bin/grep -Fq 'optimizer profile active:' "$log_file" || { print -u2 'No active optimizer in this session (observation or initialization incomplete).'; exit 1; }
+  if (( set_mouse )); then
+    /usr/bin/grep -Fq 'fast mouse look check:' "$log_file" || { print -u2 'This session has no mouse controller.'; exit 1; }
+    print -- "$mouse" > "${log_file}.profile.mouse.$$"
+    mv -f -- "${log_file}.profile.mouse.$$" "${log_file}.profile.mouse"
+    print -- "Requested mouse=$mouse; allow five seconds for readback."
+    exit 0
+  fi
+  if (( set_extras )); then
+    print -- "$extras" > "${log_file}.profile.extras.$$"
+    mv -f -- "${log_file}.profile.extras.$$" "${log_file}.profile.extras"
+    print -- "Requested camera extras=$extras; applies while post-processing is off. Allow five seconds for readback."
+    exit 0
+  fi
+  if (( set_occlusion )); then
+    /usr/bin/grep -Fq 'optimizer culling diagnostic:' "$log_file" || { print -u2 'No culling diagnostic controller in this session.'; exit 1; }
+    print -- "$occlusion" > "${log_file}.profile.occlusion.$$"
+    mv -f -- "${log_file}.profile.occlusion.$$" "${log_file}.profile.occlusion"
+    print -- "Requested occlusion=$occlusion; allow five seconds for readback."
+    exit 0
+  fi
+  if (( set_postfx )); then
+    /usr/bin/grep -Fq 'optimizer postfx status:' "$log_file" || { print -u2 'This session has no active post-processing controller.'; exit 1; }
+    print -- "$postfx" > "${log_file}.profile.postfx.$$"
+    mv -f -- "${log_file}.profile.postfx.$$" "${log_file}.profile.postfx"
+    print -- "Requested postfx=$postfx; allow five seconds for Unity readback."
+    exit 0
+  fi
+  print -- "$profile" > "${log_file}.profile.$$"
+  mv -f -- "${log_file}.profile.$$" "${log_file}.profile"
+  print -- "Requested $profile; allow five seconds for Unity readback in --status."
+  exit 0
+fi
+
+if (( show_status )); then
+  if [[ ! -f "$latest_record" ]]; then
+    print -- "No run has been recorded by this version of the launcher."
+    print -- "Start with ./testificateunlocker to collect overlay status and FPS measurements."
+    exit 0
+  fi
+  log_file=$(< "$latest_record")
+  if [[ "$log_file" != "$log_directory/"run-*.log || ! -f "$log_file" ]]; then
+    print -u2 -- "The latest run log is missing or invalid: $log_file"
+    exit 1
+  fi
+  game_pid=""
+  [[ ! -f "${log_file}.pid" ]] || game_pid=$(< "${log_file}.pid")
+  if process_is_alive "$game_pid"; then
+    print -- "Latest run: PID $game_pid is running."
+  else
+    print -- "Latest run: game process has exited. Measurements below are historical."
+  fi
+  print -- "Log: $log_file"
+  tail -n 60 "$log_file"
+  exit 0
+fi
+
+if [[ "$script_dir/src/frame_guard.c" -nt "$dylib" || "$script_dir/src/effects.c" -nt "$dylib" || "$script_dir/src/input_probe.m" -nt "$dylib" || "$script_dir/src/optimizer.c" -nt "$dylib" || ! -f "$dylib" || ! -x "$script_dir/build/launch-game" || "$script_dir/src/launch_game.c" -nt "$script_dir/build/launch-game" || "$script_dir/src/pg3d_fps_unlock.c" -nt "$dylib" || "$script_dir/src/presentation_probe.m" -nt "$dylib" || "$script_dir/src/steam_overlay_probe.c" -nt "$dylib" || "$script_dir/build.sh" -nt "$dylib" ]]; then
+  print -- "Building the current injection library."
+  "$script_dir/build.sh"
+fi
+
+if [[ ! -d "$game/Contents" || ! -x "$game/Contents/MacOS/Pixel Gun 3D" ]]; then
+  print -u2 -- "Pixel Gun 3D.app was not found at: $game"
+  print -u2 -- "Use --game '/path/to/Pixel Gun 3D.app' to select its location."
+  exit 1
+fi
+
+game=${game:A}
+steam_dir=${steam_dir:A}
+if [[ "$steam_dir" == *:* || "$dylib" == *:* ]]; then
+  print -u2 -- "Library paths cannot contain ':' (the macOS preload separator)."
+  exit 1
+fi
+game_binary="$game/Contents/MacOS/Pixel Gun 3D"
+game_working_dir="${game:h}"
+version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$game/Contents/Info.plist" 2>/dev/null || print 'unknown')
+build_number=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$game/Contents/Info.plist" 2>/dev/null || print 'unknown')
+
+print -- "Found Pixel Gun 3D $version (build $build_number)."
+if (( ! ${supported_builds[(Ie)$version/$build_number]} )); then
+  print -u2 -- "Unsupported game build $version/$build_number; supported: ${(j:, :)supported_builds}."
+  print -u2 -- "Pixel Gun 3D was probably updated. Optimizer compatibility review is required before launch;"
+  print -u2 -- "until then, start the game normally from Steam."
+  exit $EXIT_UNSUPPORTED_BUILD
+fi
+
+# The injection library is x86_64 only. A native arm64 game slice would load
+# without it, so refuse instead of silently launching an unoptimized game.
+game_archs=$(lipo -archs "$game_binary" 2>/dev/null || print unknown)
+host_arm64=$(sysctl -n hw.optional.arm64 2>/dev/null || print 0)
+if [[ " $game_archs " != *" x86_64 "* ]]; then
+  print -u2 -- "The game executable has no x86_64 code (architectures: $game_archs); the optimizer cannot load."
+  exit $EXIT_INCOMPATIBLE_GAME
+fi
+if [[ "$host_arm64" == 1 && " $game_archs " == *" arm64 "* ]]; then
+  print -u2 -- "This game build contains native Apple Silicon code ($game_archs); the x86_64 optimizer would not load."
+  print -u2 -- "A compatibility update is required before launch."
+  exit $EXIT_INCOMPATIBLE_GAME
+fi
+if [[ "$host_arm64" == 1 ]] && ! /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
+  print -u2 -- "Rosetta is required to run Pixel Gun 3D on Apple Silicon but is not available."
+  print -u2 -- "Start the game once from Steam so macOS offers to install Rosetta, then try again."
+  exit $EXIT_INCOMPATIBLE_GAME
+fi
+# Hardened runtime strips DYLD_INSERT_LIBRARIES unless the game opts out.
+signature_flags=$(codesign -dv "$game" 2>&1 | /usr/bin/sed -n 's/.*flags=\(0x[0-9a-fA-F]*\).*/\1/p' | head -n 1)
+if [[ -n "$signature_flags" ]] && (( signature_flags & 0x10000 )); then
+  entitlements=$(codesign -d --entitlements - "$game" 2>/dev/null || true)
+  if [[ "$entitlements" != *com.apple.security.cs.allow-dyld-environment-variables* ||
+        "$entitlements" != *com.apple.security.cs.disable-library-validation* ]]; then
+    print -u2 -- "This game build uses Apple's hardened runtime, which blocks the optimizer library from loading."
+    print -u2 -- "A compatibility update is required; the game itself will not be modified."
+    exit $EXIT_INCOMPATIBLE_GAME
+  fi
+fi
+
+for steam_library in steamloader.dylib gameoverlayrenderer.dylib; do
+  if [[ ! -r "$steam_dir/$steam_library" ]] || ! lipo "$steam_dir/$steam_library" -verify_arch x86_64 >/dev/null 2>&1; then
+    print -u2 -- "Missing or incompatible Steam library: $steam_dir/$steam_library"
+    print -u2 -- "Use --steam-dir to select Steam's Contents/MacOS directory."
+    exit 1
+  fi
+done
+print -- "Steam overlay libraries: $steam_dir"
+print -- "Rendering profile: $profile (observation mode disables all optimization)."
+if (( ! observe )); then
+  if [[ "$mouse" == fast ]]; then
+    print -- "Mouse mode: fast (mouse look skips AppKit window routing while the cursor is locked)."
+  else
+    print -- "Mouse mode: game (normal AppKit routing)."
+  fi
+fi
+if (( observe )); then
+  print -- "Observation mode: measure original FPS, target frame rate, and v-sync without applying overrides."
+else
+  print -- "Requested render target: $([[ "$fps" == "-1" ]] && print 'uncapped' || print -- "$fps FPS"). Requested v-sync: off."
+  print -- "Unity macOS display-link blit path: disabled (UNITY_DISPLAYLINK_BLIT=0)."
+fi
+
+steam_running=0
+while read -r process_uid process_command; do
+  if [[ "$process_uid" == "$UID" && "$process_command" == *"/steam_osx" ]]; then
+    steam_running=1
+    break
+  fi
+done < <(ps -axo uid=,comm=)
+if (( ! steam_running )); then
+  print -u2 -- "Open Steam and sign in before launching PG3D FPS Unlock."
+  exit 1
+fi
+
+if (( dry_run )); then
+  file "$dylib"
+  print -- "Preflight passed; no process was started and no runtime FPS was verified."
+  exit 0
+fi
+
+# Match the actual executable and current user. Old suspended root-owned debugger
+# processes are unrelated to a user's current launch and must not block it.
+existing_pids=()
+while read -r process_pid process_uid process_state process_command; do
+  if [[ "$process_uid" == "$UID" && "$process_state" != *Z* && "$process_command" == *"/Contents/MacOS/Pixel Gun 3D" ]]; then
+    existing_pids+=("$process_pid")
+  fi
+done < <(ps -axo pid=,uid=,stat=,comm=)
+if (( ${#existing_pids} )); then
+  print -u2 -- "Pixel Gun 3D is already running for your user (PID ${(j:, :)existing_pids})."
+  print -u2 -- "Quit that game instance, then launch it with this tool."
+  exit 1
+fi
+
+mkdir -p "$log_directory"
+log_file="$log_directory/run-$(date '+%Y%m%d-%H%M%S')-$$.log"
+print -- "[Launcher] Started $(date '+%Y-%m-%d %H:%M:%S %Z'); game $version/$build_number; requested FPS $fps; observe $observe." > "$log_file"
+
+print -- "Launching Pixel Gun 3D. Runtime log: $log_file"
+cd "$game_working_dir"
+if (( show_hud )); then
+  export MTL_HUD_ENABLED=1
+fi
+export PG3D_OPT_PROFILE="$profile"
+export PG3D_OPT_CONTROL="${log_file}.profile"
+(( ! observe )) || export PG3D_OPT_PROFILE=original
+print -- "$PG3D_OPT_PROFILE" > "$PG3D_OPT_CONTROL"
+print -- "$postfx" > "${PG3D_OPT_CONTROL}.postfx"
+print -- game > "${PG3D_OPT_CONTROL}.occlusion"
+print -- on > "${PG3D_OPT_CONTROL}.extras"
+print -- "$mouse" > "${PG3D_OPT_CONTROL}.mouse"
+if (( stage_profile && ! observe )); then
+  export PG3D_STAGE_PROFILE=1
+else
+  unset PG3D_STAGE_PROFILE
+fi
+game_arguments=()
+if (( gfx_jobs && ! observe )); then
+  game_arguments+=(-force-gfx-jobs native)
+  print -- "Experimental: requesting Unity native graphics jobs (-force-gfx-jobs native)."
+fi
+if [[ "$job_workers" != auto ]] && (( ! observe )); then
+  game_arguments+=(-job-worker-count "$job_workers")
+  print -- "Unity job worker threads: $job_workers (-job-worker-count)."
+  (( ! gfx_jobs )) || print -u2 -- "Warning: a fixed job worker count with multithreaded rendering made the screen flicker in testing; turn one of them off."
+fi
+game_pid=$("$script_dir/build/launch-game" "$game_binary" "$dylib" "$fps" "$log_file" "$observe" "$steam_dir" $game_arguments)
+print -- "$game_pid" > "${log_file}.pid"
+print -- "$log_file" > "${latest_record}.$$"
+mv -f -- "${latest_record}.$$" "$latest_record"
+
+ready_message="render pacing override is active"
+(( ! observe )) || ready_message="frame pacing observation is active"
+for attempt in {1..80}; do
+  # The first few milliseconds may still be nohup/env before exec completes.
+  # Test PID existence here; require the game executable once it reports ready.
+  if ! kill -0 "$game_pid" 2>/dev/null; then
+    print -u2 -- "Pixel Gun 3D exited before runtime verification (PID $game_pid)."
+    tail -n 30 "$log_file" >&2
+    exit 1
+  fi
+  if process_is_alive "$game_pid" && /usr/bin/grep -Fq "$ready_message" "$log_file" && /usr/bin/grep -Fq "Steam overlay: renderer_loaded=yes; api=ready; IsOverlayEnabled=yes." "$log_file"; then
+    if (( observe )); then
+      print -- "Observation is active in PID $game_pid."
+    else
+      print -- "The runtime overrides are active in PID $game_pid."
+    fi
+    if (( ! observe )) && ! /usr/bin/grep -Fq "optimizer profile active:" "$log_file"; then
+      print -u2 -- "FPS active, but optimizer initialization is unconfirmed."
+      exit 1
+    fi
+    print -- "Steam reports the overlay enabled. Press Shift+Tab in the game to check it."
+    print -- "Engine and Metal presentation measurements follow every few seconds; run ./testificateunlocker --status."
+    exit 0
+  fi
+  sleep 0.25
+done
+
+print -u2 -- "The game is running (PID $game_pid), but runtime readiness was not confirmed within 20 seconds."
+print -u2 -- "It may still be loading. Check ./testificateunlocker --status after loading finishes."
+tail -n 20 "$log_file" >&2
+exit $EXIT_NOT_READY

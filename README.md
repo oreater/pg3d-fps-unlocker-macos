@@ -1,108 +1,92 @@
-# PG3D FPS Unlocker for macOS
+# PG3D FPS Unlock
 
-This tool removes the observed 60 FPS Metal presentation bottleneck in the Steam macOS build of Pixel Gun 3D. It disables Unity's native display-link blit path with **`UNITY_DISPLAYLINK_BLIT=0` before startup**, then injects an x86_64 library to maintain `Application.targetFrameRate = -1` and `QualitySettings.vSyncCount = 0`. It records engine and Metal presentation measurements separately. It does not patch installed game files or save changes to game preferences.
+A macOS app that launches the Steam version of **Pixel Gun 3D** with its frame rate unlocked and lighter, reversible rendering settings. Version 1.5 turns the original command-line unlocker into a full app: pick a profile, press **Play**, and watch live engine FPS, Metal FPS and Steam overlay status while you play.
 
-## Requirements
+Everything happens in the running game's memory. Game files, saved game settings and your Steam install are never modified; quit the game and start it from Steam to return to normal.
 
-- Pixel Gun 3D PC Edition for Steam, installed locally.
-- Rosetta 2 (the current macOS game binary is x86_64; an installed game already normally has this).
-- Xcode Command Line Tools for the one-time local build.
+## Download and install
 
-## Build and launch
+1. Download `PG3D-FPS-Unlock-1.5.0-macOS.zip` from the [latest release](../../releases/latest) and unzip it.
+2. Move **PG3D FPS Unlock.app** to Applications (or ~/Applications).
+3. The app is not notarized. The first time, Control-click it and choose **Open**, or allow it under System Settings → Privacy & Security.
+4. Open Steam and sign in, then open the app, choose a profile and press **Play**.
 
-Keep Steam open and quit any existing game instance, then run:
+Requirements: macOS 13 or later, Pixel Gun 3D PC Edition from Steam, and Rosetta on Apple Silicon (the game itself runs as x86_64). Supported game builds: **26.11.0 (151027)** and **26.11.3 (155325)**. A newer game build is refused until it has been reviewed, because the unlocker validates exact native bindings before changing anything.
 
-```zsh
-./pg3d-fps-unlock
+## What it does
+
+**FPS unlock.** Keeps Unity's `targetFrameRate` at uncapped (or your cap) and `vSyncCount` at 0, reapplies them if the game resets them, and disables Unity's 60 Hz display-link blit path (`UNITY_DISPLAYLINK_BLIT=0`). The Steam overlay keeps working.
+
+**Rendering profiles.** Reversible quality budgets, read back from Unity before and after every change. Each is a ceiling: a lower setting the game already uses is kept. Switch profiles while playing with **Apply in game**.
+
+| Setting | Balanced | Performance |
+| --- | --- | --- |
+| Camera post-processing | Kept | Off on all active cameras (PostProcessLayer and legacy SSAO) |
+| Leftover depth pass and HDR target | Kept | Off on screen cameras whose post-processing was disabled |
+| Shadow distance | Up to 25 | Up to 15; real-time shadows off |
+| Shadow cascades / resolution | Up to 2 / Medium | 1 / Low |
+| MSAA | Up to 2× | Off |
+| Per-pixel lights | Up to 2 | Up to 1 |
+| LOD bias | Up to 1 | Up to 0.6 |
+| Anisotropic filtering | Per texture | Off |
+| Soft particles, soft vegetation, real-time reflection probes | Kept | Off |
+| Skin weights | Up to 4 bones | Up to 2 bones |
+| Particle raycast budget | Up to 256 | Up to 64 |
+
+**Original** keeps the FPS unlock and restores every value the session changed. Settings stay consistent through death and respawn: they are enforced just before Unity renders each frame.
+
+**Fast mouse look (new in 1.5).** Because the game runs under Rosetta, macOS's own window code for every mouse move runs translated too. While you're aiming (cursor locked), each move goes straight to Unity's input handler instead of through macOS's window bookkeeping: about 10 µs per move instead of about 50. Menus, clicks, keys and a free cursor keep the normal route. It stays off, and the log says why, if another library has hooked any step of that route. Can be switched mid-match.
+
+**Job worker threads (new in 1.5).** Unity starts one worker thread per CPU core minus one. On Macs with many cores, waking those workers cost about 1 ms of every frame in profiling, and more while turning, when Unity syncs moved colliders before each of the game's raycasts. This setting starts the game with Unity's own `-job-worker-count`. **4** worked well in testing: steadier FPS and noticeably better mouse input. Don't combine it with **Multithreaded rendering**; that pairing made the screen flicker, and the app warns about it.
+
+**Multithreaded rendering** (experimental) starts the game with Unity's `-force-gfx-jobs native`. It showed no gain in testing.
+
+**Frame profiler.** Times every Unity player-loop stage and compares frames with and without mouse movement, so the log shows what gets slower while you turn. `python3 tools/mouse_profile.py` summarizes the latest run.
+
+What it never does: hide objects, change camera clipping or culling masks, lower resolution or texture quality, change physics timing, touch networking, or patch game files.
+
+## Command line
+
+The app bundles the same backend used from the terminal. From a source checkout:
+
+```sh
+./pg3d-fps-unlock --profile performance
+./pg3d-fps-unlock --profile performance --mouse fast --job-workers 4
+./pg3d-fps-unlock --profile original --fps 240
+./pg3d-fps-unlock --set-profile balanced      # switch profile in the running game
+./pg3d-fps-unlock --set-mouse fast            # or game
+./pg3d-fps-unlock --status                    # latest session log
+./pg3d-fps-unlock --dry-run                   # preflight only
+./pg3d-fps-unlock --help                      # every option
 ```
 
-Use this launcher each time. Starting the game normally from Steam does not apply the fix. No extra environment-variable command is needed.
+Exit status: 0 success, 1 general failure, 2 invalid arguments, 3 unsupported game build (usually a Pixel Gun update), 4 game build cannot load the unlocker (native Apple Silicon code, hardened runtime, or Rosetta missing), 5 the game started but readiness was not confirmed within 20 seconds (usually still loading).
 
-The launcher builds automatically if its library is missing or its source changed. `./build.sh` can also be run manually; it builds and signs a temporary library, then replaces the output atomically so an existing game keeps its original mapped library.
+Session logs are written to `~/Library/Logs/OptimizerUnlocker/`.
 
-To request a specific frame-rate ceiling:
+## Build from source
 
-```zsh
-./pg3d-fps-unlock --fps 240
+Requires the Xcode Command Line Tools; no third-party downloads.
+
+```sh
+./backend/tests/run.sh   # unit tests and launcher checks; never launches the game
+./build-app.sh           # builds and ad-hoc signs "PG3D FPS Unlock.app" here
 ```
 
-The launcher waits about 20 seconds for the library to confirm that its runtime overrides are active. A launch PID or a loaded library alone does not count as success. If startup takes longer, the game continues running and the launcher reports that verification is still pending.
+The app's name and version live in `macos-app/Info.plist`.
 
-## Verify the result
-
-Once the game has loaded and its window is in the foreground, run:
-
-```zsh
-./pg3d-fps-unlock --status
-```
-
-Status identifies whether the latest run is still alive and prints its recent measurements:
-
-- `engine measurement`: Unity's frame counters, which can advance faster than Metal presentation.
-- `presentation`: actual Metal drawable acquisitions and unique nonzero presentation timestamps, plus skipped/duplicate events.
-- `presentation screen`: the game window's display refresh capabilities and mode.
-
-For Apple's on-screen Metal performance overlay, launch with:
-
-```zsh
-./pg3d-fps-unlock --hud
-```
-
-The requested target is a ceiling, not a guarantee: loading, GPU/CPU workload, background throttling, and display presentation may limit the observed result. Compare the same scene and foreground state when measuring changes. With display synchronization disabled, Metal may submit/present more frames than the panel can fully display; neither engine FPS nor presentation timestamps prove that every frame was scanned out in full. The tested MacBook panel has a maximum refresh rate of 120 Hz.
-
-To measure the original behavior, quit the game and launch an observation run:
-
-```zsh
-./pg3d-fps-unlock --observe
-./pg3d-fps-unlock --status
-```
-
-Observation mode clears `UNITY_DISPLAYLINK_BLIT` from the child environment and records the game's original target, v-sync setting, and presentation behavior without applying pacing overrides. Quit that run before starting the normal unlocker.
-
-Each run has a dedicated log under `~/Library/Logs/PG3DFPSUnlocker/`. The library writes directly to this file because Unity redirects standard error after startup. The `latest` record identifies the most recent run; its adjacent `.pid` file identifies the launched process. Previous measurements remain in their own run logs.
-
-## Options
-
-```text
---fps N          N is 30–1000. Use 0 or "uncapped" for no cap (the default).
---observe        Measure original pacing without applying overrides.
---hud            Show Apple's Metal performance overlay for this run.
---game PATH      Pixel Gun 3D.app location, when it is not in Steam's default library.
---dry-run        Check the installation and library without launching the game.
---status         Show the latest run's process state and measurements.
-```
-
-The launcher refuses another live game instance belonging to your user. It launches the executable directly with Steam's app ID and the injection environment, and detaches the game from the invoking shell.
-
-The native `launch-game` helper creates a separate process session before starting the game. This keeps the game alive when the invoking terminal command finishes; merely backgrounding it was insufficient in the test environment.
-
-## Build-specific guard
-
-The implementation targets Pixel Gun 3D PC Edition **26.11.0 (build 151027)**, Unity 2021.3.43f1. It validates the IL2CPP wrapper instructions and binding strings before redirecting their cached native callbacks. Game updates may require deriving new wrapper locations; a rebuild alone does not establish compatibility.
-
-The first implementation waited for the game to call both setters. In this build, the target-frame-rate callback initialized while the v-sync setter remained unused, so the old tool never completed initialization. The revised library resolves the v-sync binding after Unity initializes, applies both overrides, and reports the effective settings and frame rate. V-sync was already zero in the observed baseline; the cold callback alone did not prove a rendering cap.
-
-## Verified results on this installation
-
-On September 7, 2026, the default Unity display-link path produced **exactly 60 Metal drawable acquisitions/presentations per second** while Unity's engine counter reported approximately 1,044–1,068 FPS. Apple's Metal overlay independently showed about 59–60 FPS. The game window's display mode was already 120 Hz. The original settings were already `targetFrameRate=-1`, `vSyncCount=0`, with `fpsParamKey=-1` saved. Earlier engine-counter-only tests were therefore insufficient to verify a visible unlock.
-
-Launching with `UNITY_DISPLAYLINK_BLIT=0` removed that bottleneck: sampled Metal drawable acquisition rates ranged from approximately **259–818 FPS**, and unique nonzero presentation timestamps from **259–650 FPS**, varying with workload. Some submissions were skipped, as expected when rendering faster than the display. These numbers demonstrate removal of the 60 FPS presentation bottleneck, not a claim that the 120 Hz panel displays hundreds of complete frames per second.
-
-Local evidence: `~/Library/Logs/PG3DFPSUnlocker/run-20260907-113046-67461.log` (default path) and `run-20260907-113256-67642.log` (disabled path). Normal launches now set the tested environment flag automatically.
-
-The rebuilt default launcher was then tested with `./pg3d-fps-unlock --hud`, without a manually supplied environment variable. Apple's Metal overlay showed **608.92 FPS, 1.64 ms frame interval** in the lobby; its log is `run-20260907-114029-68001.log`. This independently corroborates the presentation probe and confirms that the fix is included in the launcher itself.
-
-The game's `fpsParamKey` is an integer and its neighboring Boolean is an initialization flag. The separate native Unity Boolean controlling the display-link blit path was the relevant switch in this test. This environment flag is an undocumented, build-specific Unity implementation detail; recheck after game/engine updates.
+| Path | Contents |
+| --- | --- |
+| `macos-app/` | SwiftUI app, icon generator, Info.plist, Russo One font (SIL OFL) |
+| `backend/testificateunlocker` | Launcher script: preflight, options, live controls |
+| `backend/src/` | Injected x86_64 library (FPS unlock, profiles, frame guard, fast mouse look, profiler) and the launch helper |
+| `backend/tests/` | Unit tests |
+| `tools/` | Measurement helpers (profile comparison, paired camera traces, symbolication, mouse profile summary) |
 
 ## Notes
 
-- This changes rendering pacing only. It does not alter gameplay, networking, player data, or game assets.
-- All pacing changes apply only to the launched process. To revert, quit it and start normally through Steam.
-- It deliberately starts the game executable directly rather than through `open`, because macOS does not reliably carry `DYLD_INSERT_LIBRARIES` through Launch Services.
-- The game is a signed third-party client. Use of modifications may be governed by its terms or anti-cheat policy; use this only where permitted.
-
-
-
+- Pixel Gun 3D is a signed third-party game. Use of modifications may be governed by its terms or anti-cheat policy; use this only where permitted.
+- Not affiliated with Pixel Gun 3D or Valve.
 
 ## Author's note
 vibecoded as hell.

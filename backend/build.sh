@@ -28,7 +28,12 @@ clang \
   -Werror \
   -mmacosx-version-min=10.13 \
   "$script_dir/src/pg3d_fps_unlock.c" \
+  "$script_dir/src/input_probe.m" \
+  "$script_dir/src/effects.c" \
+  "$script_dir/src/frame_guard.c" \
+  "$script_dir/src/optimizer.c" \
   "$script_dir/src/presentation_probe.m" \
+  "$script_dir/src/steam_overlay_probe.c" \
   -framework AppKit -framework QuartzCore -framework Metal \
   -o "$temporary_output"
 

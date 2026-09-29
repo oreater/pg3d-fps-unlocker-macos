@@ -1,4 +1,4 @@
-// Pixel Gun 3D macOS 26.11.0 / build 151027 (x86_64) frame pacing override.
+// Pixel Gun 3D macOS builds 151027 and 155325 (x86_64) frame pacing override.
 // This library changes process memory only; it never writes into the app bundle.
 
 #include <dispatch/dispatch.h>
@@ -17,6 +17,8 @@
 enum {
     kTargetFrameRateWrapperRva = 0x5009370,
     kVSyncCountWrapperRva = 0x500E7C0,
+    kTargetFrameRateWrapperRva155325 = 0x500A480,
+    kVSyncCountWrapperRva155325 = 0x500F8D0,
     kRetryIntervalMilliseconds = 250,
     kRetryLimit = 480,
 };
@@ -25,7 +27,7 @@ typedef void (*UnityIntSetter)(int value);
 
 typedef struct {
     const char *description;
-    uintptr_t wrapper_rva;
+    uintptr_t wrapper_rvas[2];
     const char *binding_name;
     int forced_value;
     UnityIntSetter hook;
@@ -53,8 +55,18 @@ static bool (*g_get_focused)(void);
 static struct timespec g_last_sample;
 static unsigned int g_last_frames;
 static unsigned int g_last_rendered;
+extern void pg3d_effects_bind(void *handle);
+extern void pg3d_frame_guard_bind(void *handle);
+extern void pg3d_frame_guard_start(void *(*resolve)(const char *), bool observe);
+extern void pg3d_frame_guard_sample(void);
+extern void pg3d_optimizer_start(void *(*resolve)(const char *), bool observe);
+extern void pg3d_optimizer_tick(void);
+extern void pg3d_optimizer_sample(void);
+extern void pg3d_input_start(void *(*resolve)(const char *), bool observe);
+extern void pg3d_input_sample(double elapsed);
 extern void pg3d_presentation_start(void);
 extern void pg3d_presentation_sample(double elapsed);
+extern void pg3d_steam_overlay_sample(void);
 
 static void log_message(const char *format, ...) {
     va_list arguments;
@@ -137,6 +149,8 @@ static bool find_game_assembly(void) {
             return false;
         }
         g_resolve_icall = (void *(*)(const char *))dlsym(handle, "il2cpp_resolve_icall");
+        pg3d_effects_bind(handle);
+        pg3d_frame_guard_bind(handle);
         dlclose(handle);
         log_message("attached to GameAssembly (%s)", image_name);
         return true;
@@ -173,7 +187,7 @@ static void vsync_count_hook(int ignored_value);
 
 static Override g_target_frame_rate = {
     .description = "target frame rate",
-    .wrapper_rva = kTargetFrameRateWrapperRva,
+    .wrapper_rvas = {kTargetFrameRateWrapperRva, kTargetFrameRateWrapperRva155325},
     .binding_name = "UnityEngine.Application::set_targetFrameRate(System.Int32)",
     .forced_value = -1,
     .hook = target_frame_rate_hook,
@@ -181,7 +195,7 @@ static Override g_target_frame_rate = {
 
 static Override g_vsync_count = {
     .description = "v-sync",
-    .wrapper_rva = kVSyncCountWrapperRva,
+    .wrapper_rvas = {kVSyncCountWrapperRva, kVSyncCountWrapperRva155325},
     .binding_name = "UnityEngine.QualitySettings::set_vSyncCount(System.Int32)",
     .forced_value = 0,
     .hook = vsync_count_hook,
@@ -206,18 +220,18 @@ static bool prepare_override(Override *override) {
         return true;
     }
 
-    const uintptr_t wrapper_address = g_image_slide + override->wrapper_rva;
-    if (!range_is_inside_image(wrapper_address, 32)) {
-        if (!override->binding_was_invalid) {
-            log_message("%s wrapper RVA is outside GameAssembly; unsupported build.",
-                        override->description);
-            override->binding_was_invalid = true;
+    const uint8_t *wrapper = NULL;
+    uintptr_t selected_rva = 0;
+    for (size_t i = 0; i < sizeof(override->wrapper_rvas) / sizeof(override->wrapper_rvas[0]); ++i) {
+        uintptr_t address = g_image_slide + override->wrapper_rvas[i];
+        if (range_is_inside_image(address, 32) &&
+            wrapper_matches_binding((const uint8_t *)address, override->binding_name)) {
+            wrapper = (const uint8_t *)address;
+            selected_rva = override->wrapper_rvas[i];
+            break;
         }
-        return false;
     }
-
-    const uint8_t *wrapper = (const uint8_t *)wrapper_address;
-    if (!wrapper_matches_binding(wrapper, override->binding_name)) {
+    if (wrapper == NULL) {
         if (!override->binding_was_invalid) {
             log_message("%s binding does not match this game build; no override applied.",
                         override->description);
@@ -236,6 +250,7 @@ static bool prepare_override(Override *override) {
     }
 
     override->cache_slot = cache_slot;
+    log_message("validated %s binding at RVA 0x%lx.", override->description, (unsigned long)selected_rva);
     return true;
 }
 
@@ -303,7 +318,11 @@ static bool initialize_bindings(void) {
     } else {
         log_message("frame pacing observation is active: no values changed.");
     }
+    pg3d_optimizer_start(g_resolve_icall, g_observe_only);
+    pg3d_frame_guard_start(g_resolve_icall, g_observe_only);
+    pg3d_input_start(g_resolve_icall, g_observe_only);
     pg3d_presentation_start();
+    pg3d_steam_overlay_sample();
     clock_gettime(CLOCK_MONOTONIC, &g_last_sample);
     g_last_frames = (unsigned int)g_get_frames();
     g_last_rendered = (unsigned int)g_get_rendered();
@@ -335,7 +354,12 @@ static void measure_frames(void) {
                 (double)(rendered - g_last_rendered) / elapsed,
                 (double)(frames - g_last_frames) / elapsed, elapsed,
                 g_get_target(), g_get_vsync(), g_get_focused() ? "yes" : "no");
+    pg3d_input_sample(elapsed);
+    pg3d_optimizer_tick();
+    pg3d_optimizer_sample();
+    pg3d_frame_guard_sample();
     pg3d_presentation_sample(elapsed);
+    pg3d_steam_overlay_sample();
     g_last_sample = now;
     g_last_frames = frames;
     g_last_rendered = rendered;

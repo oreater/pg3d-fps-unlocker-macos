@@ -14,6 +14,7 @@ enum { kMaxLayers = 8, kRecentTimes = 256 };
 typedef struct {
     uintptr_t identity;
     uint64_t acquired, shown, duplicate, dropped, unsupported;
+    double acquire_total, acquire_max;
     double recent[kRecentTimes];
     unsigned next_time;
     BOOL display_sync, transaction;
@@ -52,7 +53,9 @@ static void record_presented(unsigned slot, double timestamp) {
 }
 
 static id<CAMetalDrawable> observed_next_drawable(CAMetalLayer *layer, SEL cmd) {
+    double started = CACurrentMediaTime();
     id<CAMetalDrawable> drawable = g_next_drawable(layer, cmd);
+    double acquire_duration = CACurrentMediaTime() - started;
     if (drawable == nil) return nil;
 
     uintptr_t identity = (uintptr_t)(__bridge void *)layer;
@@ -75,6 +78,8 @@ static id<CAMetalDrawable> observed_next_drawable(CAMetalLayer *layer, SEL cmd) 
     }
     LayerSample *sample = &g_layers[slot];
     ++sample->acquired;
+    sample->acquire_total += acquire_duration;
+    if (acquire_duration > sample->acquire_max) sample->acquire_max = acquire_duration;
     sample->display_sync = display_sync;
     sample->transaction = transaction;
     sample->drawable_count = drawable_count;
@@ -163,6 +168,7 @@ void pg3d_presentation_sample(double elapsed) {
         snapshot[i] = g_layers[i];
         g_layers[i].acquired = g_layers[i].shown = g_layers[i].duplicate = 0;
         g_layers[i].dropped = g_layers[i].unsupported = 0;
+        g_layers[i].acquire_total = g_layers[i].acquire_max = 0;
     }
     pthread_mutex_unlock(&g_lock);
 
@@ -177,6 +183,9 @@ void pg3d_presentation_sample(double elapsed) {
                  (unsigned long long)s->dropped, (unsigned long long)s->unsupported,
                  s->display_sync, s->transaction, (unsigned long)s->drawable_count,
                  s->size.width, s->size.height);
+        pg3d_presentation_log(line);
+        snprintf(line, sizeof(line), "drawable wait: layer=%u; mean_ms=%.3f; max_ms=%.3f; blocked_ms_per_second=%.1f. Includes compositor/GPU backpressure; not GPU execution time.",
+                 i+1, s->acquired ? s->acquire_total * 1000 / s->acquired : 0, s->acquire_max * 1000, s->acquire_total * 1000 / elapsed);
         pg3d_presentation_log(line);
     }
     if (untracked != 0) {
