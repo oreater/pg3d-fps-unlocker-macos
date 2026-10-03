@@ -2,6 +2,8 @@
 #include <assert.h>
 #include "../src/input_probe.m"
 void pg3d_presentation_log(const char *message) { fprintf(stderr, "  log: %s\n", message); }
+static unsigned latency_motions;
+void pg3d_latency_motion(double event_timestamp) { (void)event_timestamp; ++latency_motions; }
 static unsigned app_sends, handler_calls, view_moves;
 static int lock_mode = 1;
 static int fake_lock(void) { return lock_mode; }
@@ -68,6 +70,7 @@ int main(void) {
         assert(fast_requested);
         [NSApp sendEvent:move]; // Fast: the game's handler runs once, AppKit routing is skipped.
         assert(app_sends == 1 && view_moves == 1 && handler_calls == 2 && fast_count == 1 && pg3d_motion_events == 2);
+        assert(latency_motions == 2); // Both routes report the move to the latency meter.
 
         lock_mode = 0; [NSApp sendEvent:move]; // Menus (cursor free): normal route again.
         assert(app_sends == 2 && view_moves == 2 && handler_calls == 3 && fast_count == 1);

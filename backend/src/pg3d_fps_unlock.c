@@ -1,4 +1,6 @@
-// Pixel Gun 3D macOS builds 151027 and 155325 (x86_64) frame pacing override.
+// Pixel Gun 3D macOS (x86_64) frame pacing override. Reviewed builds 151027,
+// 155325 (Unity 2021.3) and 156210 (Unity 2022.3) use the wrapper addresses
+// below; any other build has its wrappers found by name (src/wrapper_scan.c).
 // This library changes process memory only; it never writes into the app bundle.
 
 #include <dispatch/dispatch.h>
@@ -19,6 +21,8 @@ enum {
     kVSyncCountWrapperRva = 0x500E7C0,
     kTargetFrameRateWrapperRva155325 = 0x500A480,
     kVSyncCountWrapperRva155325 = 0x500F8D0,
+    kTargetFrameRateWrapperRva156210 = 0x547B0D0,
+    kVSyncCountWrapperRva156210 = 0x548D3E0,
     kRetryIntervalMilliseconds = 250,
     kRetryLimit = 480,
 };
@@ -27,7 +31,7 @@ typedef void (*UnityIntSetter)(int value);
 
 typedef struct {
     const char *description;
-    uintptr_t wrapper_rvas[2];
+    uintptr_t wrapper_rvas[3];
     const char *binding_name;
     int forced_value;
     UnityIntSetter hook;
@@ -37,6 +41,7 @@ typedef struct {
     bool binding_was_invalid;
 } Override;
 
+static const struct mach_header_64 *g_image_header;
 static uintptr_t g_image_slide;
 static uintptr_t g_image_start;
 static uintptr_t g_image_end;
@@ -56,6 +61,9 @@ static struct timespec g_last_sample;
 static unsigned int g_last_frames;
 static unsigned int g_last_rendered;
 extern void pg3d_effects_bind(void *handle);
+extern void pg3d_volumes_bind(void *handle);
+extern void pg3d_probe_bind(void *handle);
+extern void pg3d_optimizer_poll(void);
 extern void pg3d_frame_guard_bind(void *handle);
 extern void pg3d_frame_guard_start(void *(*resolve)(const char *), bool observe);
 extern void pg3d_frame_guard_sample(void);
@@ -67,6 +75,11 @@ extern void pg3d_input_sample(double elapsed);
 extern void pg3d_presentation_start(void);
 extern void pg3d_presentation_sample(double elapsed);
 extern void pg3d_steam_overlay_sample(void);
+extern void pg3d_metal_tuning_start(void);
+extern void pg3d_latency_sample(void);
+extern const uint8_t pg3d_wrapper_prefix[23];
+extern const uint8_t *pg3d_find_icall_wrapper(const struct mach_header_64 *header, uintptr_t slide,
+                                              const char *binding_name);
 
 static void log_message(const char *format, ...) {
     va_list arguments;
@@ -141,6 +154,7 @@ static bool find_game_assembly(void) {
             return false;
         }
 
+        g_image_header = header;
         g_image_slide = (uintptr_t)header - text_vmaddr;
         g_image_start = g_image_slide + lowest_vmaddr;
         g_image_end = g_image_slide + highest_vmaddr;
@@ -150,6 +164,8 @@ static bool find_game_assembly(void) {
         }
         g_resolve_icall = (void *(*)(const char *))dlsym(handle, "il2cpp_resolve_icall");
         pg3d_effects_bind(handle);
+        pg3d_volumes_bind(handle);
+        pg3d_probe_bind(handle);
         pg3d_frame_guard_bind(handle);
         dlclose(handle);
         log_message("attached to GameAssembly (%s)", image_name);
@@ -159,16 +175,12 @@ static bool find_game_assembly(void) {
 }
 
 static bool wrapper_matches_binding(const uint8_t *wrapper, const char *binding_name) {
-    // All Unity IL2CPP icall wrappers in this supported build begin with a lazy
+    // All Unity IL2CPP icall wrappers in the supported builds begin with a lazy
     // cached function-pointer lookup. Validate it and then validate the exact
     // resolver string before redirecting the cache slot.
-    static const uint8_t prefix[] = {
-        0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00,
-        0x48, 0x85, 0xC0, 0x74, 0x02, 0xFF, 0xE0,
-        0x55, 0x48, 0x89, 0xE5, 0x53, 0x50, 0x48, 0x8D, 0x05,
-    };
+    const uint8_t *prefix = pg3d_wrapper_prefix;
     if (memcmp(wrapper, prefix, 3) != 0 ||
-        memcmp(wrapper + 7, prefix + 7, sizeof(prefix) - 7) != 0) {
+        memcmp(wrapper + 7, prefix + 7, sizeof(pg3d_wrapper_prefix) - 7) != 0) {
         return false;
     }
 
@@ -187,7 +199,8 @@ static void vsync_count_hook(int ignored_value);
 
 static Override g_target_frame_rate = {
     .description = "target frame rate",
-    .wrapper_rvas = {kTargetFrameRateWrapperRva, kTargetFrameRateWrapperRva155325},
+    .wrapper_rvas = {kTargetFrameRateWrapperRva, kTargetFrameRateWrapperRva155325,
+                     kTargetFrameRateWrapperRva156210},
     .binding_name = "UnityEngine.Application::set_targetFrameRate(System.Int32)",
     .forced_value = -1,
     .hook = target_frame_rate_hook,
@@ -195,7 +208,7 @@ static Override g_target_frame_rate = {
 
 static Override g_vsync_count = {
     .description = "v-sync",
-    .wrapper_rvas = {kVSyncCountWrapperRva, kVSyncCountWrapperRva155325},
+    .wrapper_rvas = {kVSyncCountWrapperRva, kVSyncCountWrapperRva155325, kVSyncCountWrapperRva156210},
     .binding_name = "UnityEngine.QualitySettings::set_vSyncCount(System.Int32)",
     .forced_value = 0,
     .hook = vsync_count_hook,
@@ -229,6 +242,18 @@ static bool prepare_override(Override *override) {
             wrapper = (const uint8_t *)address;
             selected_rva = override->wrapper_rvas[i];
             break;
+        }
+    }
+    if (wrapper == NULL && g_image_header != NULL) {
+        // A build that is not listed above: find the wrapper by its binding name.
+        const uint8_t *found = pg3d_find_icall_wrapper(g_image_header, g_image_slide,
+                                                       override->binding_name);
+        if (found != NULL && range_is_inside_image((uintptr_t)found, 32) &&
+            wrapper_matches_binding(found, override->binding_name)) {
+            wrapper = found;
+            selected_rva = (uintptr_t)found - g_image_slide;
+            log_message("found %s binding by name at RVA 0x%lx (game build not in the reviewed list).",
+                        override->description, (unsigned long)selected_rva);
         }
     }
     if (wrapper == NULL) {
@@ -318,6 +343,7 @@ static bool initialize_bindings(void) {
     } else {
         log_message("frame pacing observation is active: no values changed.");
     }
+    if (!g_observe_only) pg3d_metal_tuning_start();
     pg3d_optimizer_start(g_resolve_icall, g_observe_only);
     pg3d_frame_guard_start(g_resolve_icall, g_observe_only);
     pg3d_input_start(g_resolve_icall, g_observe_only);
@@ -329,7 +355,22 @@ static bool initialize_bindings(void) {
     return true;
 }
 
+// Live frame-rate cap from the options file ("fps" key); -1 is uncapped.
+void pg3d_set_requested_fps(int fps) {
+    if (g_observe_only || fps == g_requested_frame_rate || (fps != -1 && (fps < 30 || fps > 1000))) {
+        return;
+    }
+    g_requested_frame_rate = fps;
+    g_target_frame_rate.forced_value = fps;
+    if (fps == -1) {
+        log_message("frame-rate cap changed: uncapped.");
+    } else {
+        log_message("frame-rate cap changed: %d FPS.", fps);
+    }
+}
+
 static void measure_frames(void) {
+    pg3d_optimizer_poll();
     if (!g_observe_only) {
         // The game can bypass a wrapper through an inlined icall site or change
         // quality levels. Read back pacing values and reapply only if necessary.
@@ -359,6 +400,7 @@ static void measure_frames(void) {
     pg3d_optimizer_sample();
     pg3d_frame_guard_sample();
     pg3d_presentation_sample(elapsed);
+    pg3d_latency_sample();
     pg3d_steam_overlay_sample();
     g_last_sample = now;
     g_last_frames = frames;

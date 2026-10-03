@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include "options.h"
 
 typedef void *(*Resolver)(const char *);
 extern void pg3d_presentation_log(const char *message);
@@ -41,7 +42,13 @@ static int (*fill_cameras)(void *);
 static void *(*array_new)(void *, uintptr_t);
 static uint32_t (*array_header_size)(void);
 static uint32_t camera_array_handle;
-static bool requested_disable, quiet_frame;
+static bool quiet_frame;
+// Per effect type: disabled by the current options. Layer: post-processing
+// off. Legacy SSAO: post-processing or ambient occlusion off.
+static bool type_off[3], postfx_off, depth_off;
+// Legacy SSAO components found / still enabled; volumes.c adds them to the
+// ambient occlusion status.
+unsigned pg3d_ssao_found, pg3d_ssao_enabled;
 // Camera extras: depth-texture and HDR requests left behind on cameras whose
 // post-processing we disabled. Restored to the observed values otherwise.
 static int (*get_depth_mode)(void *);
@@ -54,7 +61,6 @@ static float (*get_camera_depth)(void *);
 static void *(*object_name)(void *);
 static const uint16_t *(*string_chars)(void *);
 static int32_t (*string_length)(void *);
-static bool extras_requested = true;
 static uint64_t fast_frames, rescan_frames, reasserted;
 #define CAMERA_LIMIT 64
 #define EFFECT_TYPES 3
@@ -62,12 +68,14 @@ static uint64_t fast_frames, rescan_frames, reasserted;
 typedef struct {
     const char *space, *name, *component_name;
     uint32_t type_handle, component_handle;
+    int type;             // which of the EFFECT_TYPES this tracked slot holds
     bool baseline, owned, seen;
 } Effect;
 typedef struct {
     uint32_t camera_handle;
     int depth_baseline;
     bool hdr_baseline, owned;
+    bool hdr;             // also keep HDR off: this camera's stack is off
 } CameraExtra;
 static CameraExtra camera_extras[CAMERA_LIMIT];
 // Frame-guard cache: the active-camera list last fully scanned. Pointers are
@@ -202,11 +210,13 @@ void pg3d_effects_start(Resolver resolve) {
     }
     ready = true;
 }
-static void apply_effects(bool disable);
+static void apply_effects(void);
 static unsigned collect_cameras(void **cameras, bool *enumerated);
 static bool extras_supported(void) {
     return get_depth_mode && set_depth_mode && get_hdr && set_hdr && get_target_texture;
 }
+static bool any_type_off(void) { return type_off[0] || type_off[1] || type_off[2]; }
+bool pg3d_effects_managing(void) { return ready && (any_type_off() || (depth_off && extras_supported())); }
 static CameraExtra *extra_for(void *camera, bool create) {
     CameraExtra *free_slot = NULL;
     for (unsigned i=0; i<CAMERA_LIMIT; ++i) {
@@ -219,11 +229,13 @@ static CameraExtra *extra_for(void *camera, bool create) {
     if (!free_slot->camera_handle) return NULL;
     free_slot->depth_baseline = get_depth_mode(camera);
     free_slot->hdr_baseline = get_hdr(camera);
+    free_slot->hdr = false;
     free_slot->owned = true;
     return free_slot;
 }
-// Keep one camera's depth texture and HDR requests off; returns true if a
-// value had to be re-applied (for example after the game reset the camera).
+// Keep one camera's depth texture (and, when its stack is off, HDR) requests
+// off; returns true if a value had to be re-applied (for example after the
+// game reset the camera).
 static bool enforce_extra(CameraExtra *x, void *camera) {
     bool changed = false;
     int depth = get_depth_mode(camera);
@@ -232,7 +244,7 @@ static bool enforce_extra(CameraExtra *x, void *camera) {
         set_depth_mode(camera, 0);
         changed = true;
     }
-    if (get_hdr(camera)) {
+    if (x->hdr && get_hdr(camera)) {
         x->hdr_baseline = true;
         set_hdr(camera, false);
         changed = true;
@@ -244,16 +256,18 @@ static void release_extra(CameraExtra *x, bool restore) {
     void *camera = handle_target(x->camera_handle);
     if (restore && x->owned && alive(camera)) {
         set_depth_mode(camera, x->depth_baseline);
-        set_hdr(camera, x->hdr_baseline);
+        if (x->hdr) set_hdr(camera, x->hdr_baseline);
         char line[200];
         snprintf(line, sizeof(line), "optimizer camera extras restore: depthTextureMode=%d; allowHDR=%s; verified=%s.",
-                 x->depth_baseline, x->hdr_baseline ? "yes" : "no",
-                 get_depth_mode(camera) == x->depth_baseline && get_hdr(camera) == x->hdr_baseline ? "yes" : "NO");
-        if (!quiet_frame) pg3d_presentation_log(line);
+                 x->depth_baseline, x->hdr ? (x->hdr_baseline ? "yes" : "no") : "unchanged",
+                 get_depth_mode(camera) == x->depth_baseline && (!x->hdr || get_hdr(camera) == x->hdr_baseline) ? "yes" : "NO");
+        // Cameras that never had a depth pass (UI cameras) restore silently.
+        if (!quiet_frame && (x->depth_baseline || x->hdr)) pg3d_presentation_log(line);
     }
     handle_free(x->camera_handle);
     x->camera_handle = 0;
     x->owned = false;
+    x->hdr = false;
 }
 // Steady state: the same cameras as the last full scan. Re-disable tracked
 // effects and camera extras without GetComponent lookups.
@@ -276,7 +290,7 @@ static void enforce_tracked(void) {
     }
 }
 void pg3d_effects_frame(void) {
-    if (!ready || !requested_disable) return;
+    if (!pg3d_effects_managing()) return;
     quiet_frame = true;
     void *cameras[CAMERA_LIMIT] = {0};
     bool enumerated = false;
@@ -286,7 +300,7 @@ void pg3d_effects_frame(void) {
         enforce_tracked();
         ++fast_frames;
     } else {
-        apply_effects(true);
+        apply_effects();
         ++rescan_frames;
     }
     quiet_frame = false;
@@ -321,45 +335,30 @@ static void audit_cameras(void **cameras, unsigned count) {
         pg3d_presentation_log(line);
     }
 }
-void pg3d_effects_tick(int profile) {
-    if (!ready) return;
+static bool read_mode_file(const char *control, const char *suffix, const char *wanted) {
+    char path[PATH_MAX], mode[32], extra;
+    int n = snprintf(path, sizeof(path), "%s%s", control, suffix);
+    FILE *file = n > 0 && (size_t)n < sizeof(path) ? fopen(path, "r") : NULL;
+    if (!file) return false;
+    bool match = fscanf(file, "%31s %c", mode, &extra) == 1 && strcmp(mode, wanted) == 0;
+    fclose(file);
+    return match;
+}
+void pg3d_effects_tick(void) {
+    OptionStatus *postfx = &pg3d_option_status[OPT_POSTFX], *depth = &pg3d_option_status[OPT_DEPTH_PASS];
+    if (!ready) {
+        postfx->state = depth->state = OPT_STATE_UNAVAILABLE;
+        return;
+    }
     audit_input_settings();
-    bool disable = profile == 2;
+    postfx_off = pg3d_options[OPT_POSTFX] == 0;
+    depth_off = pg3d_options[OPT_DEPTH_PASS] == 0;
+    type_off[0] = postfx_off;
+    type_off[1] = type_off[2] = postfx_off || pg3d_options[OPT_AMBIENT_OCCLUSION] == 0;
     const char *control = getenv("PG3D_OPT_CONTROL");
-    if (control) {
-        char path[PATH_MAX], mode[32], extra;
-        int length = snprintf(path, sizeof(path), "%s.postfx", control);
-        FILE *file = length > 0 && (size_t)length < sizeof(path) ? fopen(path, "r") : NULL;
-        if (file) {
-            if (fscanf(file, "%31s %c", mode, &extra) == 1) {
-                if (strcmp(mode, "game") == 0) disable = false;
-                else if (strcmp(mode, "off") == 0) disable = true;
-            }
-            fclose(file);
-        }
-    }
-    extras_requested = true;
-    if (control) {
-        char path[PATH_MAX], mode[32], extra;
-        int n = snprintf(path, sizeof(path), "%s.extras", control);
-        FILE *file = n > 0 && (size_t)n < sizeof(path) ? fopen(path, "r") : NULL;
-        if (file) {
-            if (fscanf(file, "%31s %c", mode, &extra) == 1 && strcmp(mode, "off") == 0) extras_requested = false;
-            fclose(file);
-        }
-    }
     void *camera = main_camera();
     if (get_occlusion && set_occlusion) {
-        bool culling_off = false;
-        if (control) {
-            char path[PATH_MAX], mode[32], extra;
-            int n = snprintf(path, sizeof(path), "%s.occlusion", control);
-            FILE *file = n > 0 && (size_t)n < sizeof(path) ? fopen(path, "r") : NULL;
-            if (file) {
-                culling_off = fscanf(file, "%31s %c", mode, &extra) == 1 && strcmp(mode, "off") == 0;
-                fclose(file);
-            }
-        }
+        bool culling_off = control && read_mode_file(control, ".occlusion", "off");
         void *previous = culling_camera_handle ? handle_target(culling_camera_handle) : NULL;
         if (culling_camera_handle && (!culling_off || previous != camera)) {
             if (alive(previous)) set_occlusion(previous, culling_baseline);
@@ -378,8 +377,7 @@ void pg3d_effects_tick(int profile) {
                  camera ? (get_occlusion(camera) ? "on" : "off") : "unknown");
         pg3d_presentation_log(line);
     }
-    requested_disable = disable;
-    apply_effects(disable);
+    apply_effects();
     char line[200];
     snprintf(line, sizeof(line), "optimizer frame cache: fast=%llu; rescans=%llu; reasserted=%llu.",
              (unsigned long long)fast_frames, (unsigned long long)rescan_frames, (unsigned long long)reasserted);
@@ -416,23 +414,28 @@ static unsigned collect_cameras(void **cameras, bool *enumerated_out) {
     *enumerated_out = enumerated;
     return count;
 }
-static void apply_effects(bool disable) {
+static void apply_effects(void) {
     void *cameras[CAMERA_LIMIT] = {0};
     bool enumerated = false;
     unsigned count = collect_cameras(cameras, &enumerated);
     if (!quiet_frame) audit_cameras(cameras, count);
-    bool extras_on = disable && extras_requested && extras_supported();
+    bool extras_on = (postfx_off || depth_off) && extras_supported();
     for (unsigned i=0; i<EFFECT_LIMIT; ++i) {
         effects[i].seen = false;
-        if (!disable || (effects[i].component_handle && !alive(handle_target(effects[i].component_handle))))
+        if (effects[i].component_handle &&
+            (!type_off[effects[i].type] || !alive(handle_target(effects[i].component_handle))))
             release_component(&effects[i]);
     }
     for (unsigned i=0; i<CAMERA_LIMIT; ++i) {
         CameraExtra *x = &camera_extras[i];
         if (!x->camera_handle) continue;
-        if (!extras_on || !alive(handle_target(x->camera_handle))) release_extra(x, extras_on ? false : true);
+        void *camera = handle_target(x->camera_handle);
+        // Restore when the option that asked for it is back on; a destroyed
+        // camera is only forgotten.
+        if (!alive(camera)) release_extra(x, false);
+        else if (!extras_on || (!depth_off && !x->hdr)) release_extra(x, true);
     }
-    unsigned found=0, disabled=0, extras=0;
+    unsigned found[EFFECT_TYPES]={0}, enabled[EFFECT_TYPES]={0}, extras=0;
     for (unsigned c=0; c<count; ++c) {
       bool owns_effect = false;
       void *game_object = alive(cameras[c]) ? get_game_object(cameras[c]) : NULL;
@@ -440,8 +443,11 @@ static void apply_effects(bool disable) {
         void *type = effects[i].type_handle ? handle_target(effects[i].type_handle) : NULL;
         void *object = game_object && type ? get_component(game_object, type) : NULL;
         if (!alive(object)) continue;
-        ++found;
-        if (!disable) continue;
+        ++found[i];
+        if (!type_off[i]) {
+            if (get_enabled(object)) ++enabled[i];
+            continue;
+        }
         Effect *e = NULL;
         for (unsigned j=0; j<EFFECT_LIMIT; ++j) {
             if (effects[j].component_handle && handle_target(effects[j].component_handle) == object) {
@@ -462,6 +468,7 @@ static void apply_effects(bool disable) {
             e->component_handle = handle_new(object, false);
             e->baseline = current;
             e->component_name = effects[i].name;
+            e->type = (int)i;
         }
         if (!e->component_handle) continue;
         // An observed game reset to enabled becomes the restoration baseline.
@@ -475,29 +482,48 @@ static void apply_effects(bool disable) {
         }
         e->owned = true;
         owns_effect = true;
-        if (!get_enabled(object)) ++disabled;
+        if (get_enabled(object)) ++enabled[i];
       }
-      // Only cameras whose post-processing we disabled: that stack is what
-      // requested the extra depth pass and the HDR intermediate target.
-      if (extras_on && owns_effect && !get_target_texture(cameras[c])) {
+      // Post-processing off: only cameras whose stack we disabled, since that
+      // stack is what requested the extra depth pass and the HDR target.
+      // Depth pre-pass off: every screen camera, HDR untouched.
+      bool stack_off = postfx_off && owns_effect;
+      if (extras_on && (stack_off || depth_off) && !get_target_texture(cameras[c])) {
         CameraExtra *x = extra_for(cameras[c], true);
         if (x) {
+            if (x->hdr && !stack_off) set_hdr(cameras[c], x->hdr_baseline); // stack back on
+            x->hdr = stack_off;
             enforce_extra(x, cameras[c]);
-            if (get_depth_mode(cameras[c]) == 0 && !get_hdr(cameras[c])) ++extras;
+            if (get_depth_mode(cameras[c]) == 0) ++extras;
         }
       }
     }
-    if (disable) {
+    bool managing = any_type_off() || extras_on;
+    if (managing) {
         memcpy(scanned_cameras, cameras, count * sizeof(void *));
         scanned_count = count;
         scanned_valid = enumerated;
     } else scanned_valid = false;
+    pg3d_ssao_found = found[1] + found[2];
+    pg3d_ssao_enabled = enabled[1] + enabled[2];
+    OptionStatus *postfx = &pg3d_option_status[OPT_POSTFX], *depth = &pg3d_option_status[OPT_DEPTH_PASS];
+    postfx->state = !postfx_off ? OPT_STATE_GAME : found[0] == 0 ? OPT_STATE_ALREADY : OPT_STATE_APPLIED;
+    postfx->game = found[0];
+    postfx->current = enabled[0];
+    unsigned depth_owned = 0;
+    for (unsigned i=0; i<CAMERA_LIMIT; ++i)
+        if (camera_extras[i].camera_handle && camera_extras[i].owned && camera_extras[i].depth_baseline) ++depth_owned;
+    depth->state = !extras_supported() ? OPT_STATE_UNAVAILABLE : !depth_off ? OPT_STATE_GAME :
+                   depth_owned ? OPT_STATE_APPLIED : OPT_STATE_ALREADY;
+    depth->game = depth_owned;
+    depth->current = 0;
     // A death camera or pooled player camera can disappear temporarily. Keep
-    // its original state and the override until explicit profile restoration
-    // or native destruction; inactivity is not permission to re-enable it.
+    // its original state and the override until explicit restoration or
+    // native destruction; inactivity is not permission to re-enable it.
     char line[300];
-    snprintf(line, sizeof(line), "optimizer postfx status: cameras=%u; scope=%s; found=%u; disabled=%u; policy=%s; camera_extras=%s:%u. Baked lighting and custom shadow meshes are unaffected.",
-             count, enumerated ? "active" : "main_fallback", found, disabled, disable ? "off" : "game",
-             !extras_supported() ? "unavailable" : extras_on ? "on" : "off", extras);
+    snprintf(line, sizeof(line), "optimizer postfx status: cameras=%u; scope=%s; found=%u; disabled=%u; ssao=%u/%u; policy=%s; depth_pass=%s; camera_extras=%s:%u. Baked lighting and custom shadow meshes are unaffected.",
+             count, enumerated ? "active" : "main_fallback", found[0], found[0] - enabled[0],
+             pg3d_ssao_found - pg3d_ssao_enabled, pg3d_ssao_found, postfx_off ? "off" : "game",
+             depth_off ? "off" : "game", !extras_supported() ? "unavailable" : extras_on ? "on" : "off", extras);
     if (!quiet_frame) pg3d_presentation_log(line);
 }

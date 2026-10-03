@@ -9,6 +9,9 @@
 #include <stdio.h>
 
 extern void pg3d_presentation_log(const char *text);
+typedef struct { double rendered, motion; } LatencyMark;
+extern bool pg3d_latency_take(LatencyMark *out);
+extern void pg3d_latency_presented(LatencyMark mark, double presented);
 
 enum { kMaxLayers = 8, kRecentTimes = 256 };
 typedef struct {
@@ -57,6 +60,8 @@ static id<CAMetalDrawable> observed_next_drawable(CAMetalLayer *layer, SEL cmd) 
     id<CAMetalDrawable> drawable = g_next_drawable(layer, cmd);
     double acquire_duration = CACurrentMediaTime() - started;
     if (drawable == nil) return nil;
+    LatencyMark mark = {0, 0};
+    bool timed = pg3d_latency_take(&mark);
 
     uintptr_t identity = (uintptr_t)(__bridge void *)layer;
     BOOL display_sync = layer.displaySyncEnabled;
@@ -90,7 +95,9 @@ static id<CAMetalDrawable> observed_next_drawable(CAMetalLayer *layer, SEL cmd) 
         if ([drawable respondsToSelector:@selector(addPresentedHandler:)]) {
             // Capture only the slot, never the drawable that owns this block.
             [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
-                record_presented(slot, presented.presentedTime);
+                double when = presented.presentedTime;
+                record_presented(slot, when);
+                if (timed) pg3d_latency_presented(mark, when);
             }];
             return drawable;
         }

@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 extern void pg3d_presentation_log(const char *message);
+extern void pg3d_latency_motion(double event_timestamp);
 static void (*original_send_event)(id, SEL, NSEvent *);
 static uint64_t motion_count, button_count, fast_count;
 static uint64_t lock_counts[4];
@@ -55,7 +56,9 @@ static void measured_send_event(id application, SEL selector, NSEvent *event) {
         return;
     }
     double start = CACurrentMediaTime();
-    double age = NSProcessInfo.processInfo.systemUptime - event.timestamp;
+    double stamp = event.timestamp;
+    double age = NSProcessInfo.processInfo.systemUptime - stamp;
+    pg3d_latency_motion(stamp);
     int lock = cursor_lock_state ? cursor_lock_state() : -1;
     ++lock_counts[lock >= 0 && lock <= 2 ? lock : 3];
     BOOL fast = fast_path_applies(event, lock);

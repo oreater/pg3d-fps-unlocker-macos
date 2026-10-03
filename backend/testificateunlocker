@@ -13,12 +13,12 @@ observe=0
 show_hud=0
 profile=balanced
 set_profile=0
-postfx=profile
-set_postfx=0
+set_options=0
+set_fps=0
+probe=0
+option_overrides=()
 set_occlusion=0
 occlusion=game
-set_extras=0
-extras=on
 set_mouse=0
 mouse=game
 stage_profile=1
@@ -29,7 +29,24 @@ log_directory="$HOME/Library/Logs/OptimizerUnlocker"
 latest_record="$log_directory/latest"
 # Single source of truth for reviewed builds. The native library validates each
 # build's exact bindings again at runtime before changing anything.
-supported_builds=(26.11.0/151027 26.11.3/155325)
+supported_builds=(26.11.0/151027 26.11.3/155325 26.12.0/156210)
+# Unity versions the library is written against. A build that is not reviewed
+# yet still launches on one of these: the library finds its bindings by name,
+# validates each one, and changes nothing it cannot read back.
+supported_unity=(2021.3 2022.3)
+# Graphics options and presets: one line per option in options.tsv (shared
+# with the app). Columns: key, tab, label, hint, choices, Original, Balanced,
+# Performance. Every value is a ceiling on the game's own setting.
+option_keys=()
+typeset -A option_choices option_label preset_original preset_balanced preset_performance
+while IFS=$'\t' read -r key group label hint choices original balanced performance; do
+  [[ -n "$key" && "$key" != \#* ]] || continue
+  option_keys+=("$key")
+  option_label[$key]=$label
+  option_choices[$key]="|${choices}|"
+  preset_original[$key]=$original; preset_balanced[$key]=$balanced; preset_performance[$key]=$performance
+done < "$script_dir/options.tsv"
+(( ${#option_keys} )) || { print -u2 -- "Missing option catalogue: $script_dir/options.tsv"; exit 1; }
 
 # Exit status: 0 success, 1 general failure, 2 invalid arguments,
 # 3 unsupported game build, 4 game binary cannot load the optimizer,
@@ -42,15 +59,17 @@ Usage: ./testificateunlocker [options]
 
   --fps N          30–1000, or 0 / uncapped for no cap (default: uncapped)
   --observe        Measure the game's original pacing without changing it
-  --profile NAME   original / balanced (default) / performance
+  --profile NAME   Graphics preset: original / balanced (default) / performance
+  --option KEY=VALUE[,KEY=VALUE...]  Override preset options at launch (repeatable)
+  --list-options   Print every graphics option, its choices and the presets
+  --set-profile NAME Switch the running game to a preset (all options)
+  --set KEY=VALUE[,KEY=VALUE...]  Change options in the running game
+  --set-fps N      Change the frame-rate cap in the running game (0 = uncapped)
+  --probe          Write a scene inventory (cameras, effects, lights) to the session log
   --set-occlusion MODE Diagnostic: game / off in current session
-  --postfx MODE    profile (default) / game / off, for the main camera
-  --set-postfx MODE Change post-processing alone in the current session
-  --set-profile NAME Change profile in the current optimizer session
   --hud            Show Apple's Metal performance overlay for this run
   --gfx-jobs       Experimental: ask Unity for multithreaded (native) graphics jobs
   --job-workers N  auto (default) or 1–32: Unity job worker threads (-job-worker-count)
-  --set-camera-extras on|off  Performance: drop leftover depth/HDR camera work (default on)
   --mouse MODE     game (default) / fast: fast mouse look skips AppKit window
                    routing for mouse motion while the game has the cursor locked
   --set-mouse MODE Change the mouse mode in the current session
@@ -60,6 +79,7 @@ Usage: ./testificateunlocker [options]
   --dry-run        Validate prerequisites without launching
   --status         Show the latest run's process status and measurements
   --supported-builds Print reviewed game builds (VERSION/BUILD), one per line
+  --supported-unity  Print Unity versions (MAJOR.MINOR) that unreviewed builds may use
   -h, --help       Show this help
 EOF
 }
@@ -86,11 +106,37 @@ while (( $# )); do
       (( $# >= 2 )) || { print -u2 -- '--set-occlusion needs a value'; exit 2; }
       [[ "$2" == game || "$2" == off ]] || { print -u2 'Occlusion mode must be game or off.'; exit 2; }
       set_occlusion=1; occlusion="$2"; shift 2 ;;
-    --postfx|--set-postfx)
-      (( $# >= 2 )) || { print -u2 -- "$1 needs a value"; exit 2; }
-      [[ "$2" == profile || "$2" == game || "$2" == off ]] || { print -u2 'Post FX mode must be profile, game, or off.'; exit 2; }
-      [[ "$1" != --set-postfx ]] || set_postfx=1
-      postfx="$2"; shift 2 ;;
+    --option|--set)
+      (( $# >= 2 )) || { print -u2 -- "$1 needs KEY=VALUE"; exit 2; }
+      for pair in ${(s:,:)2}; do
+        key=${pair%%=*} value=${pair#*=}
+        if [[ "$pair" != *=* || -z "${option_label[$key]-}" ]]; then
+          print -u2 -- "Unknown graphics option: ${pair%%=*}. See --list-options."; exit 2
+        fi
+        if [[ "${option_choices[$key]}" != *"|$value:"* ]]; then
+          print -u2 -- "Invalid value for $key: $value. See --list-options."; exit 2
+        fi
+        option_overrides+=("$key=$value")
+      done
+      [[ "$1" != --set ]] || set_options=1
+      shift 2 ;;
+    --set-fps)
+      (( $# >= 2 )) || { print -u2 -- '--set-fps needs a value'; exit 2; }
+      case "$2" in
+        0|uncapped) fps="-1" ;;
+        <->) (( $2 >= 30 && $2 <= 1000 )) || { print -u2 -- "FPS must be 30–1000, 0, or uncapped."; exit 2; }; fps="$2" ;;
+        *) print -u2 -- "FPS must be 30–1000, 0, or uncapped."; exit 2 ;;
+      esac
+      set_fps=1; shift 2 ;;
+    --probe) probe=1; shift ;;
+    --list-options)
+      print -- "Graphics, input and engine options (choices; presets Original / Balanced / Performance):"
+      for key in $option_keys; do
+        presets="[${preset_original[$key]} / ${preset_balanced[$key]} / ${preset_performance[$key]}]"
+        [[ "${preset_original[$key]}" != - ]] || presets="(not part of the presets)"
+        print -- "  $key  ${option_label[$key]}: ${${${option_choices[$key]#|}%|}//|/, }  $presets"
+      done
+      exit 0 ;;
     --profile|--set-profile)
       (( $# >= 2 )) || { print -u2 -- "$1 needs a value"; exit 2; }
       [[ "$2" == original || "$2" == balanced || "$2" == performance ]] || { print -u2 -- "Profile must be original, balanced, or performance."; exit 2; }
@@ -108,10 +154,6 @@ while (( $# )); do
         print -u2 -- 'Job workers must be auto or 1–32.'; exit 2
       fi
       shift 2 ;;
-    --set-camera-extras)
-      (( $# >= 2 )) || { print -u2 -- '--set-camera-extras needs a value'; exit 2; }
-      [[ "$2" == on || "$2" == off ]] || { print -u2 'Camera extras mode must be on or off.'; exit 2; }
-      set_extras=1; extras="$2"; shift 2 ;;
     --mouse|--set-mouse)
       (( $# >= 2 )) || { print -u2 -- "$1 needs a value"; exit 2; }
       [[ "$2" == game || "$2" == fast ]] || { print -u2 'Mouse mode must be game or fast.'; exit 2; }
@@ -132,6 +174,7 @@ while (( $# )); do
     --dry-run) dry_run=1; shift ;;
     --status) show_status=1; shift ;;
     --supported-builds) print -l -- $supported_builds; exit 0 ;;
+    --supported-unity) print -l -- $supported_unity; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     *) print -u2 -- "Unknown option: $1"; usage >&2; exit 2 ;;
   esac
@@ -145,26 +188,57 @@ process_is_alive() {
   [[ "$process_uid" == "$UID" && -n "$process_state" && "$process_state" != *Z* && "$process_command" == *"/Contents/MacOS/Pixel Gun 3D" ]]
 }
 
-if (( set_profile + set_postfx + set_occlusion + set_extras + set_mouse > 1 )); then
+# Options file (<log>.profile.options): key=value for every graphics option,
+# plus the frame-rate cap. The optimizer reloads it within a second of a change.
+typeset -A chosen
+file_fps=-1
+load_preset() {
+  local key value
+  for key in $option_keys; do
+    case $1 in
+      original) value=${preset_original[$key]} ;;
+      balanced) value=${preset_balanced[$key]} ;;
+      *) value=${preset_performance[$key]} ;;
+    esac
+    # "-": an input or engine setting, which presets leave as it is.
+    if [[ "$value" == - ]]; then chosen[$key]=${chosen[$key]:-game}; else chosen[$key]=$value; fi
+  done
+}
+apply_overrides() {
+  local pair
+  for pair in $option_overrides; do chosen[${pair%%=*}]=${pair#*=}; done
+}
+read_options_file() {
+  local line key
+  [[ -r "$1" ]] || return 1
+  while IFS= read -r line; do
+    [[ "$line" == *=* ]] || continue
+    key=${line%%=*}
+    if [[ "$key" == fps ]]; then file_fps=${line#*=}
+    elif [[ -n "${option_label[$key]-}" && "${option_choices[$key]}" == *"|${line#*=}:"* ]]; then chosen[$key]=${line#*=}
+    fi
+  done < "$1"
+}
+write_options_file() { # path fps
+  local key
+  { for key in $option_keys; do print -r -- "$key=${chosen[$key]}"; done; print -r -- "fps=$2"; } > "$1.$$"
+  mv -f -- "$1.$$" "$1"
+}
+
+if (( set_profile + set_options + set_fps + probe + set_occlusion + set_mouse > 1 )); then
   print -u2 'Use one live control command at a time.'; exit 2
 fi
-if (( set_profile || set_postfx || set_occlusion || set_extras || set_mouse )); then
+if (( set_profile || set_options || set_fps || probe || set_occlusion || set_mouse )); then
   [[ -f "$latest_record" ]] || { print -u2 'No optimizer session.'; exit 1; }
   log_file=$(< "$latest_record")
   [[ "$log_file" == "$log_directory/"run-*.log && -f "${log_file}.pid" && -f "${log_file}.profile" ]] || { print -u2 'Invalid session.'; exit 1; }
   process_is_alive "$(< "${log_file}.pid")" || { print -u2 'Optimizer game is not running.'; exit 1; }
-  /usr/bin/grep -Fq 'optimizer profile active:' "$log_file" || { print -u2 'No active optimizer in this session (observation or initialization incomplete).'; exit 1; }
+  /usr/bin/grep -Fq 'optimizer active;' "$log_file" || { print -u2 'No active optimizer in this session (observation, an older version, or initialization incomplete).'; exit 1; }
   if (( set_mouse )); then
     /usr/bin/grep -Fq 'fast mouse look check:' "$log_file" || { print -u2 'This session has no mouse controller.'; exit 1; }
     print -- "$mouse" > "${log_file}.profile.mouse.$$"
     mv -f -- "${log_file}.profile.mouse.$$" "${log_file}.profile.mouse"
     print -- "Requested mouse=$mouse; allow five seconds for readback."
-    exit 0
-  fi
-  if (( set_extras )); then
-    print -- "$extras" > "${log_file}.profile.extras.$$"
-    mv -f -- "${log_file}.profile.extras.$$" "${log_file}.profile.extras"
-    print -- "Requested camera extras=$extras; applies while post-processing is off. Allow five seconds for readback."
     exit 0
   fi
   if (( set_occlusion )); then
@@ -174,16 +248,27 @@ if (( set_profile || set_postfx || set_occlusion || set_extras || set_mouse )); 
     print -- "Requested occlusion=$occlusion; allow five seconds for readback."
     exit 0
   fi
-  if (( set_postfx )); then
-    /usr/bin/grep -Fq 'optimizer postfx status:' "$log_file" || { print -u2 'This session has no active post-processing controller.'; exit 1; }
-    print -- "$postfx" > "${log_file}.profile.postfx.$$"
-    mv -f -- "${log_file}.profile.postfx.$$" "${log_file}.profile.postfx"
-    print -- "Requested postfx=$postfx; allow five seconds for Unity readback."
+  if (( probe )); then
+    print -- "$(date +%s)" > "${log_file}.profile.probe.$$"
+    mv -f -- "${log_file}.profile.probe.$$" "${log_file}.profile.probe"
+    print -- "Scene inventory requested; it is written to the session log within a second (lines starting with 'probe:')."
     exit 0
   fi
-  print -- "$profile" > "${log_file}.profile.$$"
-  mv -f -- "${log_file}.profile.$$" "${log_file}.profile"
-  print -- "Requested $profile; allow five seconds for Unity readback in --status."
+  options_path="${log_file}.profile.options"
+  load_preset original
+  read_options_file "$options_path" || true
+  if (( set_profile )); then
+    load_preset "$profile"
+    print -- "$profile" > "${log_file}.profile"
+  fi
+  apply_overrides
+  (( ! set_fps )) || file_fps=$fps
+  write_options_file "$options_path" "$file_fps"
+  if (( set_profile )); then print -- "Requested the $profile preset."
+  elif (( set_fps )); then print -- "Requested frame-rate cap $([[ "$fps" == "-1" ]] && print uncapped || print -- "$fps FPS")."
+  else print -- "Requested ${(j:, :)option_overrides}."
+  fi
+  print -- "The game applies it within a second; --status shows the Unity readback."
   exit 0
 fi
 
@@ -210,7 +295,12 @@ if (( show_status )); then
   exit 0
 fi
 
-if [[ "$script_dir/src/frame_guard.c" -nt "$dylib" || "$script_dir/src/effects.c" -nt "$dylib" || "$script_dir/src/input_probe.m" -nt "$dylib" || "$script_dir/src/optimizer.c" -nt "$dylib" || ! -f "$dylib" || ! -x "$script_dir/build/launch-game" || "$script_dir/src/launch_game.c" -nt "$script_dir/build/launch-game" || "$script_dir/src/pg3d_fps_unlock.c" -nt "$dylib" || "$script_dir/src/presentation_probe.m" -nt "$dylib" || "$script_dir/src/steam_overlay_probe.c" -nt "$dylib" || "$script_dir/build.sh" -nt "$dylib" ]]; then
+needs_build=0
+[[ -f "$dylib" && -x "$script_dir/build/launch-game" ]] || needs_build=1
+for source in "$script_dir"/src/*(N) "$script_dir/build.sh"; do
+  [[ ! "$source" -nt "$dylib" ]] || needs_build=1
+done
+if (( needs_build )); then
   print -- "Building the current injection library."
   "$script_dir/build.sh"
 fi
@@ -232,12 +322,21 @@ game_working_dir="${game:h}"
 version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$game/Contents/Info.plist" 2>/dev/null || print 'unknown')
 build_number=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$game/Contents/Info.plist" 2>/dev/null || print 'unknown')
 
-print -- "Found Pixel Gun 3D $version (build $build_number)."
+# "Unity Player version 2022.3.76f1 (d938583f0741). ..."
+unity_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleGetInfoString' "$game/Contents/Info.plist" 2>/dev/null |
+  /usr/bin/sed -n 's/^Unity Player version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9A-Za-z]*\).*/\1/p')
+unity_line=${${unity_version:-unknown}%.*}
+
+print -- "Found Pixel Gun 3D $version (build $build_number, Unity ${unity_version:-unknown})."
 if (( ! ${supported_builds[(Ie)$version/$build_number]} )); then
-  print -u2 -- "Unsupported game build $version/$build_number; supported: ${(j:, :)supported_builds}."
-  print -u2 -- "Pixel Gun 3D was probably updated. Optimizer compatibility review is required before launch;"
-  print -u2 -- "until then, start the game normally from Steam."
-  exit $EXIT_UNSUPPORTED_BUILD
+  if (( ! ${supported_unity[(Ie)$unity_line]} )); then
+    print -u2 -- "Unsupported game build $version/$build_number (Unity ${unity_version:-unknown}); supported: ${(j:, :)supported_builds}."
+    print -u2 -- "Pixel Gun 3D was probably updated. Optimizer compatibility review is required before launch;"
+    print -u2 -- "until then, start the game normally from Steam."
+    exit $EXIT_UNSUPPORTED_BUILD
+  fi
+  print -- "Game build $version/$build_number is not reviewed yet; Unity $unity_version is supported."
+  print -- "The optimizer finds and checks every binding by name at launch and leaves alone anything it cannot verify."
 fi
 
 # The injection library is x86_64 only. A native arm64 game slice would load
@@ -278,7 +377,7 @@ for steam_library in steamloader.dylib gameoverlayrenderer.dylib; do
   fi
 done
 print -- "Steam overlay libraries: $steam_dir"
-print -- "Rendering profile: $profile (observation mode disables all optimization)."
+print -- "Graphics preset: $profile${option_overrides:+ with ${#option_overrides} option changes} (observation mode disables all optimization)."
 if (( ! observe )); then
   if [[ "$mouse" == fast ]]; then
     print -- "Mouse mode: fast (mouse look skips AppKit window routing while the cursor is locked)."
@@ -334,13 +433,13 @@ cd "$game_working_dir"
 if (( show_hud )); then
   export MTL_HUD_ENABLED=1
 fi
-export PG3D_OPT_PROFILE="$profile"
 export PG3D_OPT_CONTROL="${log_file}.profile"
-(( ! observe )) || export PG3D_OPT_PROFILE=original
-print -- "$PG3D_OPT_PROFILE" > "$PG3D_OPT_CONTROL"
-print -- "$postfx" > "${PG3D_OPT_CONTROL}.postfx"
+unset PG3D_OPT_PROFILE
+print -- "$profile" > "$PG3D_OPT_CONTROL"
+load_preset "$profile"
+apply_overrides
+write_options_file "${PG3D_OPT_CONTROL}.options" "$fps"
 print -- game > "${PG3D_OPT_CONTROL}.occlusion"
-print -- on > "${PG3D_OPT_CONTROL}.extras"
 print -- "$mouse" > "${PG3D_OPT_CONTROL}.mouse"
 if (( stage_profile && ! observe )); then
   export PG3D_STAGE_PROFILE=1
@@ -378,7 +477,7 @@ for attempt in {1..80}; do
     else
       print -- "The runtime overrides are active in PID $game_pid."
     fi
-    if (( ! observe )) && ! /usr/bin/grep -Fq "optimizer profile active:" "$log_file"; then
+    if (( ! observe )) && ! /usr/bin/grep -Fq "optimizer active;" "$log_file"; then
       print -u2 -- "FPS active, but optimizer initialization is unconfirmed."
       exit 1
     fi

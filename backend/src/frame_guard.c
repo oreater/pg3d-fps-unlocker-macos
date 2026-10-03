@@ -22,6 +22,7 @@
 
 typedef void *(*Resolver)(const char *);
 extern void pg3d_optimizer_frame(void);
+extern void pg3d_latency_frame(void);
 extern void pg3d_presentation_log(const char *);
 extern volatile uint64_t pg3d_motion_events;
 static void *(*domain_get)(void);
@@ -50,6 +51,7 @@ static void before_render(void) {
     struct timespec a,b;
     clock_gettime(CLOCK_MONOTONIC,&a);
     pg3d_optimizer_frame();
+    pg3d_latency_frame();
     clock_gettime(CLOCK_MONOTONIC,&b);
     frame_ns += (uint64_t)((b.tv_sec-a.tv_sec)*1000000000LL+b.tv_nsec-a.tv_nsec);
     ++frame_calls;

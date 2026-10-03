@@ -7,6 +7,7 @@ void pg3d_presentation_log(const char *message) {
     if (strstr(message, "stages (ms/frame")) snprintf(last_stage_line, sizeof(last_stage_line), "%s", message);
 }
 void pg3d_optimizer_frame(void) { ++updates; }
+void pg3d_latency_frame(void) {}
 static void render_stage(void) { assert(updates==renders+1); ++renders; }
 
 // A small player loop in Unity's flattened pre-order layout: root, then each

@@ -1,0 +1,26 @@
+# PG3D FPS Unlock graphics options: key, tab, label, hint, choices (value:label|...), Original, Balanced, Performance.
+# Read by the launcher script and the app. Keys must match src/options.c; every graphics value is a ceiling on the game's own.
+# Engine rows (tab engine) are not ceilings and not part of the presets: their preset columns are "-".
+postfx	effects	Post-processing	The whole screen-effect stack on the game camera, plus the depth and HDR passes it needs. Off overrides the effects below.	game:Game|0:Off	game	game	0
+ambient-occlusion	effects	Ambient occlusion	Soft contact shadows in corners and creases. One of the costlier effects.	game:Game|0:Off	game	0	0
+bloom	effects	Bloom	Glow around bright lights and muzzle flashes.	game:Game|0:Off	game	0	0
+color-grading	effects	Color grading	The map's color and tone curve. Off looks flatter.	game:Game|0:Off	game	game	0
+auto-exposure	effects	Auto exposure	Brightness adapting as you move between light and dark areas.	game:Game|0:Off	game	game	0
+lens-effects	effects	Lens effects	Chromatic aberration, vignette, film grain and lens distortion.	game:Game|0:Off	game	0	0
+dof-motion-blur	effects	Depth of field & motion blur	Background blur and blur while turning.	game:Game|0:Off	game	0	0
+depth-pass	effects	Depth pre-pass	An extra pass over the scene that soft particles read. Effects that need it keep it while they are on.	game:Game|0:Off	game	game	0
+fog	effects	Distance fog	Haze toward the horizon. Costs almost nothing; off changes the look.	game:Game|0:Off	game	game	game
+shadows	lighting	Real-time shadows	Shadows cast by players, props and weapons.	game:Game|1:Hard only|0:Off	game	game	0
+shadow-quality	lighting	Shadow quality	Shadow distance, cascades and resolution. Medium: 25 m, 2 cascades. Low: 15 m, 1 cascade.	game:Game|1:Medium|0:Low	game	1	0
+pixel-lights	lighting	Per-pixel lights	Lights drawn per pixel; the rest fall back to cheaper vertex lighting.	game:Game|2:2|1:1|0:0	game	2	1
+reflections	lighting	Real-time reflections	Reflection probes that re-render the scene, and screen-space reflections.	game:Game|0:Off	game	game	0
+msaa	detail	Anti-aliasing (MSAA)	Smooths jagged edges by rendering extra samples.	game:Game|2:2x|0:Off	game	2	0
+aniso	detail	Anisotropic filtering	Sharper textures at glancing angles.	game:Game|1:Per texture|0:Off	game	1	0
+lod	detail	Model detail	How far models keep their detailed versions (LOD bias). The game uses 100, so it never simplifies.	game:Game|200:2.0|100:1.0|60:0.6|30:0.3	game	100	60
+textures	detail	Texture resolution	Lower resolutions free video memory. Changing it can hitch once.	game:Game|1:Half|2:Quarter	game	game	game
+skin-weights	detail	Skinning quality	Bones per vertex on animated characters and weapons.	game:Game|4:4 bones|2:2 bones|1:1 bone	game	4	2
+soft-particles	detail	Soft particles	Smoke and sparks that fade into walls; needs the depth pass.	game:Game|0:Off	game	game	0
+soft-vegetation	detail	Soft vegetation	Extra pass for alpha-blended grass and leaves.	game:Game|0:Off	game	game	0
+particle-raycasts	detail	Particle collisions	Raycast budget for particles that bounce off the world.	game:Game|256:256|64:64|16:16	game	256	64
+engine-threads	engine	Engine thread priority	Unity runs its job workers below normal priority, so other apps can delay the jobs each frame waits for. High lifts them and the render thread.	game:Game|1:High	-	-	-
+gpu-priority	engine	GPU priority	Schedules the game’s GPU work ahead of other apps, such as browser video or a Discord stream.	game:Game|1:High	-	-	-
